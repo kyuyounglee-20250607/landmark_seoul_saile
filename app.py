@@ -4,20 +4,17 @@ import requests
 import json
 from dotenv import load_dotenv
 import os
-import aiohttp
 import asyncio
+import aiohttp
 import time
 from datetime import datetime
 import folium
 from streamlit_folium import folium_static
 from folium import plugins
-import folium
-from streamlit_folium import folium_static
 
 # API 키 로드 함수
 def load_api_keys():
     """환경에 따라 적절한 방식으로 API 키 로드"""
-    # 로컬 환경 (.env 파일)
     if os.path.exists(".env"):
         load_dotenv()
         return {
@@ -25,7 +22,6 @@ def load_api_keys():
             "REST_API": os.getenv("REST_API"),
             "KAKAO_JAVA_SCRIPT_KEY": os.getenv("KAKAO_JAVA_SCRIPT_KEY")
         }
-    # Streamlit Cloud 환경
     else:
         return {
             "SEOUL_LANDMARK_API": st.secrets["SEOUL_LANDMARK_API"],
@@ -53,67 +49,232 @@ def get_coordinates(address):
     params = {'query': address}
     
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=10)
         if response.status_code == 200:
-            result = response.json()['documents'][0]
-            return float(result['x']), float(result['y'])
+            result = response.json()
+            if result.get('documents'):
+                doc = result['documents'][0]
+                return float(doc['x']), float(doc['y'])
     except Exception as e:
-        st.error(f"위경도 조회 중 오류 발생: {e}")
-        return None, None
+        pass
     
     return None, None
 
-# 임대차 데이터 조회 함수
-async def _get_rent_data_async(gu_code, gu_name, start_idx, end_idx):
-    """비동기 데이터 조회 함수"""
-    url = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/tbLnOpendataRentV/{start_idx}/{end_idx}/2025/{gu_code}/{gu_name}"    
+# URL 파라미터 생성 함수
+def build_api_params(gu_code=None, dong_code=None):
+    """API URL 파라미터 문자열 생성
+    서울시 OpenAPI는 선택적 파라미터를 순서대로 전달
+    형식: /START/END 또는 /START/END/접수연도/자치구코드/자치구명/법정동코드/...
+    """
+    if not gu_code and not dong_code:
+        return ""
+    
+    # 접수연도는 빈 값으로, 자치구코드만 또는 자치구코드+법정동코드 전달
+    params = []
+    
+    # 접수연도 (선택사항이지만 순서상 필요할 수 있음)
+    # params.append("")  # 비워두기
+    
+    if gu_code:
+        params.append(str(gu_code))
+    
+    if dong_code:
+        params.append(str(dong_code))
+    
+    return "/" + "/".join(params) if params else ""
+
+# 전체 데이터 개수 조회 (필터 적용)
+async def get_total_count(gu_code=None, dong_code=None):
+    """구/동 필터를 적용한 전체 데이터 개수 조회 (1/1로 요청)"""
+    # 필터링은 URL이 아닌 데이터 수신 후 처리
+    # 서울시 API는 URL 파라미터로 필터링을 지원하지 않을 수 있음
+    
+    url = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/tbLnOpendataRentV/1/1000"
+    
+    print(f"[DEBUG] Total Count URL: {url}")  # 디버깅용
+    
+    timeout = aiohttp.ClientTimeout(total=30)
+    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:                
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data['tbLnOpendataRentV']
+                    
+                    if 'tbLnOpendataRentV' in data:
+                        result = data['tbLnOpendataRentV']
+                        
+                        if 'list_total_count' in result:
+                            total_count = int(result['list_total_count'])
+                            
+                            # 샘플 데이터로 필드명 확인
+                            if 'row' in result and len(result['row']) > 0:
+                                sample = result['row'][0]
+                                print(f"[DEBUG] Sample data keys: {sample.keys()}")
+                            
+                            return total_count, None
+                        
+                        if 'RESULT' in result:
+                            code = result['RESULT'].get('CODE')
+                            msg = result['RESULT'].get('MESSAGE', '알 수 없는 오류')
+                            return None, f"API 오류: {code} - {msg}"
+                    
+                    return None, f"잘못된 응답 형식: {data}"
                 else:
-                    st.error(f"API 오류 발생: {response.status}")
-                    return None
+                    return None, f"HTTP 오류: {response.status}"
+                    
+    except asyncio.TimeoutError:
+        return None, "요청 시간 초과"
     except Exception as e:
-        st.error(f"데이터 조회 중 오류 발생: {e}")
-        return None
+        return None, f"오류 발생: {str(e)}"
 
-@st.cache_data(ttl=3600)  # 1시간 동안 캐시 유지
-def get_rent_data(gu_code, gu_name, start_idx, end_idx):
-    """캐시 가능한 동기 래퍼 함수"""
-    result = asyncio.run(_get_rent_data_async(gu_code, gu_name, start_idx, end_idx))
-    if result:
-        return result.get('row', []), result.get('list_total_count', 0)
-    return [], 0
-
-@st.cache_data(ttl=3600)
-def get_cached_data(gu_code, gu_name, chunk_size=1000):
-    """데이터 캐시 최적화 함수"""
-    try:
-        # 초기 데이터로 전체 개수 확인
-        initial_data, total_count = get_rent_data(gu_code, gu_name, 1, 1)
-        if total_count == 0:
-            return None, "데이터가 없습니다."
-        
-        # 전체 데이터 수집
-        all_data = []
-        total_pages = (total_count + chunk_size - 1) // chunk_size
-        
-        for page in range(total_pages):
-            start_idx = page * chunk_size + 1
-            end_idx = min((page + 1) * chunk_size, total_count)
+# 비동기 데이터 조회 함수
+async def fetch_data_async(session, start_idx, end_idx, gu_code=None, dong_code=None, max_retries=3):
+    """비동기로 단일 범위 데이터 조회 (필터링 없이 전체 조회)"""
+    # 서울시 API는 URL 파라미터 필터링을 지원하지 않으므로 전체 조회 후 필터링
+    url = f"http://openapi.seoul.go.kr:8088/{SEOUL_API_KEY}/json/tbLnOpendataRentV/{start_idx}/{end_idx}"
+    
+    for retry in range(max_retries):
+        try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if 'tbLnOpendataRentV' in data:
+                        result = data['tbLnOpendataRentV']
+                        
+                        if 'row' in result:
+                            rows = result['row']
+                            
+                            # 클라이언트 사이드 필터링
+                            if gu_code or dong_code:
+                                filtered_rows = []
+                                for row in rows:
+                                    # CGG_CD 필드로 자치구 필터링
+                                    if gu_code and row.get('CGG_CD') != str(gu_code):
+                                        continue
+                                    # STDG_CD 필드로 법정동 필터링
+                                    if dong_code and row.get('STDG_CD') != str(dong_code):
+                                        continue
+                                    filtered_rows.append(row)
+                                return filtered_rows, None
+                            
+                            return rows, None
+                        
+                        if 'RESULT' in result:
+                            code = result['RESULT'].get('CODE')
+                            if code == 'INFO-200':  # 데이터 없음
+                                return [], None
+                            msg = result['RESULT'].get('MESSAGE', '알 수 없는 오류')
+                            
+                            # 재시도 가능한 오류인 경우
+                            if retry < max_retries - 1:
+                                await asyncio.sleep(2 ** retry)
+                                continue
+                            
+                            return None, f"API 오류: {code} - {msg}"
+                    
+                    return None, "잘못된 응답 형식"
+                else:
+                    if retry < max_retries - 1:
+                        await asyncio.sleep(2 ** retry)
+                        continue
+                    return None, f"HTTP 오류: {response.status}"
+                    
+        except asyncio.TimeoutError:
+            if retry < max_retries - 1:
+                await asyncio.sleep(2 ** retry)
+                continue
+            return None, f"요청 시간 초과 (범위: {start_idx}-{end_idx})"
             
-            page_data, _ = get_rent_data(gu_code, gu_name, start_idx, end_idx)
-            if page_data:
-                all_data.extend(page_data)
-            time.sleep(0.5)  # API 요청 간격 조절
+        except Exception as e:
+            if retry < max_retries - 1:
+                await asyncio.sleep(2 ** retry)
+                continue
+            return None, f"오류 발생: {str(e)}"
+    
+    return None, "최대 재시도 횟수 초과"
+
+# 순차적 비동기 데이터 수집
+async def collect_data_sequential(total_count, gu_code=None, dong_code=None, progress_callback=None):
+    """비동기로 순차적으로 데이터 수집 (100건씩)"""
+    all_data = []
+    batch_size = 100
+    current_idx = 1
+    
+    # 타임아웃 설정 (30초로 증가)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while current_idx <= total_count:
+            end_idx = min(current_idx + batch_size - 1, total_count)
+            
+            if progress_callback:
+                progress_callback(
+                    current_idx, 
+                    end_idx, 
+                    total_count, 
+                    len(all_data)
+                )
+            
+            # 비동기로 데이터 조회 (파라미터 전달)
+            data, error = await fetch_data_async(session, current_idx, end_idx, gu_code, dong_code)
+            
+            if error:
+                # 에러 발생 시 로깅하고 계속 진행
+                if progress_callback:
+                    progress_callback(
+                        current_idx, 
+                        end_idx, 
+                        total_count, 
+                        len(all_data),
+                        error=f"⚠️ 범위 {current_idx}-{end_idx} 조회 실패: {error}"
+                    )
+                # 다음 배치로 이동
+                current_idx = end_idx + 1
+                await asyncio.sleep(1)  # 에러 후 대기
+                continue
+            
+            if data:
+                all_data.extend(data)
+            
+            # 다음 범위로 이동
+            current_idx = end_idx + 1
+            
+            # API 부하 방지를 위한 대기 (성공 시에만)
+            await asyncio.sleep(0.2)
+    
+    return all_data
+
+# 동기 래퍼 함수
+def get_all_rent_data(gu_code=None, dong_code=None, progress_callback=None):
+    """전체 데이터 수집 (동기 래퍼)"""
+    
+    # 1단계: 전체 개수 조회
+    if progress_callback:
+        progress_callback(0, 0, 0, 0, status="전체 데이터 개수 조회 중...")
+    
+    total_count, error = asyncio.run(get_total_count(gu_code, dong_code))
+    
+    if error:
+        return None, error
+    
+    if not total_count or total_count == 0:
+        return None, "조회된 데이터가 없습니다."
+    
+    if progress_callback:
+        progress_callback(0, 0, total_count, 0, status=f"총 {total_count:,}건의 데이터 수집 시작...")
+    
+    # 2단계: 비동기로 순차적 데이터 수집 (파라미터 전달)
+    try:
+        all_data = asyncio.run(collect_data_sequential(total_count, gu_code, dong_code, progress_callback))
         
-        return pd.DataFrame(all_data), None
+        if all_data:
+            return pd.DataFrame(all_data), None
+        return None, "데이터 수집 실패"
         
     except Exception as e:
-        return None, f"데이터 수집 중 오류 발생: {str(e)}"
+        return None, f"데이터 수집 중 오류: {str(e)}"
 
 def preprocess_data(df):
     """데이터 전처리 함수"""
@@ -155,8 +316,8 @@ def preprocess_data(df):
         st.error(f"데이터 전처리 중 오류 발생: {str(e)}")
         return None
 
-# 주소 생성 함수
 def create_address(row, gu_name):
+    """주소 생성 함수"""
     address = f"서울특별시 {gu_name} {row['법정동명']}"
     if row['지번구분명'] == '산':
         address += f" {row['지번구분명']}"
@@ -171,22 +332,18 @@ def create_address(row, gu_name):
         pass
     return address
 
-# Folium 지도 생성 함수
 def create_folium_map(data_df, center_lat, center_lng):
-    # 기본 지도 생성
+    """Folium 지도 생성 함수"""
     m = folium.Map(
         location=[center_lat, center_lng],
         zoom_start=14,
         tiles='OpenStreetMap'
     )
     
-    # 마커 클러스터 생성
     marker_cluster = plugins.MarkerCluster().add_to(m)
     
-    # 데이터포인트 추가
     for _, row in data_df.iterrows():
         if pd.notna(row['위도']) and pd.notna(row['경도']):
-            # 팝업 내용 생성
             popup_content = f"""
                 <div style='width:200px'>
                 <b>{row['건물명'] if pd.notna(row['건물명']) else row['주소']}</b><br>
@@ -198,10 +355,8 @@ def create_folium_map(data_df, center_lat, center_lng):
                 </div>
             """
             
-            # 마커 색상 설정 (전세/월세 구분)
             color = 'red' if row['전월세구분'] == '전세' else 'blue'
             
-            # 마커 추가
             folium.Marker(
                 location=[row['위도'], row['경도']],
                 popup=folium.Popup(popup_content, max_width=300),
@@ -210,141 +365,68 @@ def create_folium_map(data_df, center_lat, center_lng):
             ).add_to(marker_cluster)
     
     return m
-    # HTML 템플릿에 데이터 삽입
-    markers = []
-    for _, row in data_df.iterrows():
-        if pd.notna(row['위도']) and pd.notna(row['경도']):
-            marker = {
-                'position': {'lat': row['위도'], 'lng': row['경도']},
-                'content': f"{row['건물명'] if row['건물명'] else row['주소']}<br>전월세구분: {row['전월세구분']}<br>보증금: {row['보증금(만원)']}만원<br>임대료: {row['임대료(만원)']}만원"
-            }
-            markers.append(marker)
-    
-    map_html = f"""
-    <div id="map" style="width:100%;height:600px;"></div>
-    <script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JAVA_SCRIPT_KEY}&autoload=false"></script>
-    <script>
-        kakao.maps.load(function() {{
-            var container = document.getElementById('map');
-            var options = {{
-                center: new kakao.maps.LatLng({center_lat}, {center_lng}),
-                level: 5
-            }};
-            var map = new kakao.maps.Map(container, options);
-        
-        var markers = {json.dumps(markers)};
-        markers.forEach(function(markerInfo) {{
-            var marker = new kakao.maps.Marker({{
-                position: new kakao.maps.LatLng(markerInfo.position.lat, markerInfo.position.lng),
-                map: map
-            }});
-            
-            var infowindow = new kakao.maps.InfoWindow({{
-                content: markerInfo.content
-            }});
-            
-            kakao.maps.event.addListener(marker, 'click', function() {{
-                infowindow.open(map, marker);
-            }});
-        }});
-        }});
-    </script>
-    """
-    return map_html
 
-def filter_and_display_data(df, status_container=None, progress_bar=None):
+def filter_and_display_data(df):
     """필터링 및 데이터 표시 함수"""
     if df is None or df.empty:
         st.warning("표시할 데이터가 없습니다.")
         return
 
-    # 필터링 옵션
     st.subheader("필터링 옵션")
     
-    # 보증금 범위 슬라이더
-    min_deposit_value = int(df['보증금(만원)'].fillna(0).min())
-    max_deposit_value = int(df['보증금(만원)'].fillna(0).max())
-    deposit_range = st.slider(
-        "보증금 범위 (만원)",
-        min_value=min_deposit_value,
-        max_value=max_deposit_value,
-        value=(min_deposit_value, max_deposit_value),
-        format="%d"
-    )
-    min_deposit, max_deposit = deposit_range
+    col1, col2 = st.columns(2)
     
-    # 임대료 범위 슬라이더
-    min_rent_value = int(df['임대료(만원)'].fillna(0).min())
-    max_rent_value = int(df['임대료(만원)'].fillna(0).max())
-    rent_range = st.slider(
-        "임대료 범위 (만원)",
-        min_value=min_rent_value,
-        max_value=max_rent_value,
-        value=(min_rent_value, max_rent_value),
-        format="%d"
-    )
-    min_rent, max_rent = rent_range
+    with col1:
+        min_deposit_value = int(df['보증금(만원)'].fillna(0).min())
+        max_deposit_value = int(df['보증금(만원)'].fillna(0).max())
+        deposit_range = st.slider(
+            "보증금 범위 (만원)",
+            min_value=min_deposit_value,
+            max_value=max_deposit_value,
+            value=(min_deposit_value, max_deposit_value)
+        )
     
-    # 계약기간 범위 슬라이더 (있는 경우)
-    period_range = None
-    if '계약기간' in df.columns:
-        period_values = pd.to_numeric(df['계약기간'], errors='coerce').dropna()
-        if not period_values.empty:
-            min_period_value = int(period_values.min())
-            max_period_value = int(period_values.max())
-            period_range = st.slider(
-                "계약기간 (개월)",
-                min_value=min_period_value,
-                max_value=max_period_value,
-                value=(min_period_value, max_period_value),
-                format="%d"
-            )
+    with col2:
+        min_rent_value = int(df['임대료(만원)'].fillna(0).min())
+        max_rent_value = int(df['임대료(만원)'].fillna(0).max())
+        rent_range = st.slider(
+            "임대료 범위 (만원)",
+            min_value=min_rent_value,
+            max_value=max_rent_value,
+            value=(min_rent_value, max_rent_value)
+        )
 
     # 필터링 적용
     filtered_df = df[
-        (df['보증금(만원)'] >= min_deposit) &
-        (df['보증금(만원)'] <= max_deposit) &
-        (df['임대료(만원)'] >= min_rent) &
-        (df['임대료(만원)'] <= max_rent)
+        (df['보증금(만원)'] >= deposit_range[0]) &
+        (df['보증금(만원)'] <= deposit_range[1]) &
+        (df['임대료(만원)'] >= rent_range[0]) &
+        (df['임대료(만원)'] <= rent_range[1])
     ]
 
-    if period_range is not None:
-        min_period, max_period = period_range
-        filtered_df = filtered_df[
-            pd.to_numeric(filtered_df['계약기간'], errors='coerce').between(min_period, max_period)
-        ]
-
-    # 결과 표시
     st.subheader("조회 결과")
     st.write(f"총 {len(filtered_df):,}건의 데이터가 조회되었습니다.")
 
-    # 지도 표시
     if not filtered_df.empty:
-        center_lat = filtered_df['위도'].mean()
-        center_lng = filtered_df['경도'].mean()
+        # 지도 표시
+        valid_coords = filtered_df[filtered_df['위도'].notna() & filtered_df['경도'].notna()]
         
-        if status_container:
-            status_container.text("🗺️ 지도를 생성중입니다...")
-        if progress_bar:
-            progress_bar.progress(0.5)
+        if not valid_coords.empty:
+            center_lat = valid_coords['위도'].mean()
+            center_lng = valid_coords['경도'].mean()
             
-        # Folium 지도 생성 및 표시
-        map_obj = create_folium_map(filtered_df, center_lat, center_lng)
-        folium_static(map_obj)
-        
-        if progress_bar:
-            progress_bar.progress(1.0)
-        if status_container:
-            status_container.text("✨ 모든 처리가 완료되었습니다!")
+            with st.spinner("지도를 생성중입니다..."):
+                map_obj = create_folium_map(valid_coords, center_lat, center_lng)
+                folium_static(map_obj, width=1200, height=600)
 
         # 데이터 테이블 표시
         st.subheader("상세 데이터")
-        st.dataframe(filtered_df)
+        st.dataframe(filtered_df, use_container_width=True, height=400)
         
         # CSV 다운로드 버튼
         csv_data = filtered_df.to_csv(index=False, encoding='utf-8-sig')
         st.download_button(
-            label="CSV 파일 다운로드",
+            label="📥 CSV 파일 다운로드",
             data=csv_data,
             file_name=f"서울시_임대_정보_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv"
@@ -352,338 +434,217 @@ def filter_and_display_data(df, status_container=None, progress_bar=None):
     else:
         st.warning("조건에 맞는 데이터가 없습니다.")
 
-def main():
-    st.title("서울시 임대차 정보 조회")
-    
-    # 세션 상태 초기화
+def initialize_session_state():
+    """세션 상태 초기화"""
     if 'full_data_df' not in st.session_state:
         st.session_state.full_data_df = None
     if 'selected_gu_info' not in st.session_state:
         st.session_state.selected_gu_info = None
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
+
+def load_location_codes():
+    """법정동 코드 데이터 로드"""
+    try:
+        codes_df = pd.read_csv('code.csv')
+        return codes_df
+    except Exception as e:
+        st.error(f"법정동 코드 파일 로드 중 오류 발생: {e}")
+        return None
+
+def main():
+    st.title("🏢 서울시 임대차 정보 조회")
+    
+    initialize_session_state()
     
     # 사이드바 설정
     with st.sidebar:
-        st.header("데이터 조회 설정")
+        st.header("📍 데이터 조회 설정")
         
-        # 법정동 코드 데이터 로드
-        try:
-            codes_df = pd.read_csv('code.csv')
-            gu_options = codes_df[['code', 'name']].values.tolist()
-        except Exception as e:
-            st.error(f"법정동 코드 파일 로드 중 오류 발생: {e}")
+        codes_df = load_location_codes()
+        if codes_df is None:
             return
-
+            
         # 자치구 선택
+        gu_options = codes_df[['자치구코드', '자치구명']].drop_duplicates()
         selected_gu = st.selectbox(
             "자치구 선택",
-            options=gu_options,
+            options=gu_options.values.tolist(),
             format_func=lambda x: x[1]
         )
         
-        chunk_size = st.number_input(
-            "데이터 로드 단위",
-            min_value=100,
-            max_value=1000,
-            value=1000,
-            step=100,
-            help="한 번에 가져올 데이터의 개수입니다."
+        # 법정동 선택
+        dong_options = codes_df[
+            codes_df['자치구코드'] == selected_gu[0]
+        ][['법정동코드', '법정동명']].drop_duplicates()
+        
+        dong_options = pd.concat([
+            pd.DataFrame([['', '전체']], columns=['법정동코드', '법정동명']),
+            dong_options
+        ])
+        
+        selected_dong = st.selectbox(
+            "법정동 선택",
+            options=dong_options.values.tolist(),
+            format_func=lambda x: x[1]
         )
 
-    # 새로운 데이터 조회가 필요한 경우에만 API 호출
-    if st.button("데이터 조회") or (st.session_state.selected_gu_info != selected_gu):
-        # 상태 표시 컨테이너 초기화
-        status_container = st.empty()
-        progress_container = st.empty()
-        result_container = st.empty()
+        st.divider()
+        load_data = st.button("🔍 데이터 조회", type="primary", use_container_width=True)
+    
+    # 데이터 조회
+    if load_data:
+        status_placeholder = st.empty()
+        progress_bar = st.progress(0)
+        detail_placeholder = st.empty()
         
-        # 데이터 조회 시작
-        with st.spinner("🔍 데이터를 조회중입니다..."):
-            # 캐시된 데이터 조회
-            df, error_msg = get_cached_data(
-                selected_gu[0], 
-                selected_gu[1], 
-                chunk_size=chunk_size
+        try:
+            # 진행 상태 콜백 함수
+            def update_progress(start_idx, end_idx, total, collected, status=None, error=None):
+                if error:
+                    detail_placeholder.warning(error)
+                    return
+                
+                if status:
+                    status_placeholder.info(f"📥 {status}")
+                    return
+                
+                if total > 0:
+                    progress = min(end_idx / total, 1.0)
+                    progress_bar.progress(progress)
+                    
+                    status_msg = f"📥 데이터 수집 중: {start_idx:,} ~ {end_idx:,} / {total:,}건"
+                    status_placeholder.info(status_msg)
+                    detail_placeholder.text(f"✅ 현재까지 수집된 데이터: {collected:,}건")
+            
+            # 데이터 수집 시작
+            df, error_msg = get_all_rent_data(
+                gu_code=selected_gu[0],
+                dong_code=selected_dong[0] if selected_dong[0] else None,
+                progress_callback=update_progress
             )
             
             if error_msg:
-                st.error(error_msg)
+                status_placeholder.error(f"❌ {error_msg}")
+                progress_bar.empty()
+                detail_placeholder.empty()
                 return
-                
+            
+            if df is None or df.empty:
+                status_placeholder.warning("⚠️ 조회된 데이터가 없습니다.")
+                progress_bar.empty()
+                detail_placeholder.empty()
+                return
+            
+            progress_bar.progress(1.0)
+            status_placeholder.success(f"✅ {len(df):,}건의 데이터를 수집했습니다.")
+            detail_placeholder.empty()
+            
             # 데이터 전처리
+            status_placeholder.info("⚙️ 데이터를 전처리하고 있습니다...")
+            
             df = preprocess_data(df)
             if df is None:
-                st.error("데이터 전처리 중 오류가 발생했습니다.")
+                status_placeholder.error("❌ 데이터 전처리 실패")
+                progress_bar.empty()
                 return
             
             # 주소 생성
             df['주소'] = df.apply(lambda x: create_address(x, selected_gu[1]), axis=1)
             
-            # 위치 정보 조회 진행률 표시
-            status_container.text("🌍 위치 정보를 조회중입니다...")
-            progress_bar = progress_container.progress(0)
+            # 위치 정보 조회
+            status_placeholder.info("🌍 위치 정보를 조회하고 있습니다...")
             
             coordinates = []
-            total_addresses = len(df['주소'])
+            total = len(df)
             
             for idx, address in enumerate(df['주소']):
                 lng, lat = get_coordinates(address)
                 coordinates.append((lat, lng))
-                progress = (idx + 1) / total_addresses
-                progress_bar.progress(progress)
-                status_container.text(f"🌍 위치 정보를 조회중입니다... ({idx + 1}/{total_addresses})")
+                
+                if (idx + 1) % 50 == 0:  # 50건마다 업데이트
+                    progress = (idx + 1) / total
+                    progress_bar.progress(progress)
+                    status_placeholder.info(f"🌍 위치 정보 조회 중... ({idx + 1:,}/{total:,})")
             
             df['위도'] = [coord[0] for coord in coordinates]
             df['경도'] = [coord[1] for coord in coordinates]
             
-            # 데이터를 세션 상태에 저장
+            progress_bar.progress(1.0)
+            status_placeholder.success("✅ 모든 데이터 처리가 완료되었습니다!")
+            
+            # 세션 상태 저장
             st.session_state.full_data_df = df
             st.session_state.selected_gu_info = selected_gu
             st.session_state.data_loaded = True
             
-            # 완료 메시지 표시
-            status_container.text("✅ 데이터 수집이 완료되었습니다!")
-            progress_bar.progress(1.0)
+            time.sleep(1)
+            progress_bar.empty()
+            status_placeholder.empty()
             
-            # 기본 통계 정보 표시
-            with st.expander("📊 기본 통계 정보", expanded=True):
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("총 데이터 수", f"{len(df):,}건")
-                with col2:
-                    st.metric("평균 보증금", f"{df['보증금(만원)'].mean():,.0f}만원")
-                with col3:
-                    st.metric("평균 임대료", f"{df['임대료(만원)'].mean():,.0f}만원")
+        except Exception as e:
+            status_placeholder.error(f"❌ 오류 발생: {str(e)}")
+            progress_bar.empty()
+            detail_placeholder.empty()
+            return
     
-    # 저장된 데이터가 있으면 필터링 및 표시
+    # 로딩 완료 후 데이터 표시
     if st.session_state.data_loaded and st.session_state.full_data_df is not None:
-        # 데이터 분석 탭 생성
+        df = st.session_state.full_data_df
+        
+        st.success(f"✅ {st.session_state.selected_gu_info[1]} 데이터 로드 완료")
+        
+        # 기본 통계
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("총 데이터", f"{len(df):,}건")
+        with col2:
+            st.metric("평균 보증금", f"{df['보증금(만원)'].mean():,.0f}만원")
+        with col3:
+            st.metric("평균 임대료", f"{df['임대료(만원)'].mean():,.0f}만원")
+        with col4:
+            valid_coords = df[df['위도'].notna()].shape[0]
+            st.metric("좌표 확인", f"{valid_coords:,}건")
+        
+        st.divider()
+        
+        # 탭 생성
         tab1, tab2, tab3 = st.tabs(["📊 데이터 분석", "🗺️ 지도 보기", "📋 상세 데이터"])
         
         with tab1:
-            df = st.session_state.full_data_df
-            
-            # 기간별 분석
-            st.subheader("기간별 분석")
             if '계약일' in df.columns:
-                df['계약월'] = pd.to_datetime(df['계약일']).dt.strftime('%Y-%m')
-                monthly_stats = df.groupby('계약월').agg({
+                st.subheader("📅 월별 계약 현황")
+                df_copy = df.copy()
+                df_copy['계약월'] = pd.to_datetime(df_copy['계약일'], errors='coerce').dt.strftime('%Y-%m')
+                monthly_stats = df_copy.groupby('계약월').agg({
                     '보증금(만원)': 'mean',
-                    '임대료(만원)': 'mean',
-                    '임대면적(㎡)': 'mean'
-                }).round(2)
+                    '임대료(만원)': 'mean'
+                }).round(0)
                 st.line_chart(monthly_stats)
             
-            # 지역별 분석
-            st.subheader("지역별 분석")
             if '법정동명' in df.columns:
+                st.subheader("📍 지역별 평균 가격")
                 dong_stats = df.groupby('법정동명').agg({
                     '보증금(만원)': 'mean',
                     '임대료(만원)': 'mean'
-                }).round(2)
+                }).round(0).sort_values('보증금(만원)', ascending=False)
                 st.bar_chart(dong_stats)
         
         with tab2:
-            filter_and_display_data(
-                st.session_state.full_data_df,
-                status_container if 'status_container' in locals() else None,
-                progress_bar if 'progress_bar' in locals() else None
-            )
-            
+            filter_and_display_data(df)
+        
         with tab3:
-            st.dataframe(
-                st.session_state.full_data_df,
-                use_container_width=True,
-                height=400
-            )
+            st.dataframe(df, use_container_width=True, height=500)
             
-        total_count = initial_data[0].get('총건수', 1000)  # 기본값 1000
-        page_size = 1000
-        total_pages = (total_count + page_size - 1) // page_size
-        
-        # 진행 상태 업데이트
-        result_container.info(f"총 {total_count:,}건의 데이터를 조회합니다.")
-        
-        # 전체 데이터 수집
-        all_data = []
-        for page in range(total_pages):
-            start_idx = page * page_size + 1
-            end_idx = min((page + 1) * page_size, total_count)
-            
-            # 진행률 업데이트
-            progress = (page + 1) / total_pages
-            status_container.text(f"🔍 데이터를 조회중입니다... ({start_idx:,}~{end_idx:,}/{total_count:,})")
-            progress_bar.progress(progress)
-            
-            # 데이터 조회
-            page_data = get_rent_data(selected_gu[0], selected_gu[1], start_idx, end_idx)
-            if page_data:
-                all_data.extend(page_data)
-            time.sleep(0.5)  # API 요청 간격 조절
-        
-        # 진행 완료
-        progress_bar.progress(1.0)
-        status_container.text("✅ 데이터 조회가 완료되었습니다!")
-        
-        if not all_data:
-            st.error("데이터를 조회할 수 없습니다.")
-            return
-            
-        data = all_data
-
-
-
-        # 데이터프레임 생성 및 전처리
-        df = pd.DataFrame(data)
-        
-        # 숫자형 컬럼 변환
-        numeric_columns = ['GRFE', 'RTFE', 'MNO', 'SNO', 'FLR', 'RENT_AREA']
-        for col in numeric_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # 컬럼명 한글 변환
-        column_mapping = {
-            'STDG_NM': '법정동명',
-            'LOTNO_SE_NM': '지번구분명',
-            'MNO': '본번',
-            'SNO': '부번',
-            'FLR': '층',
-            'CTRT_DAY': '계약일',
-            'RENT_SE': '전월세구분',
-            'RENT_AREA': '임대면적(㎡)',
-            'GRFE': '보증금(만원)',
-            'RTFE': '임대료(만원)',
-            'BLDG_NM': '건물명',
-            'ARCH_YR': '건축년도',
-            'BLDG_USG': '건물용도',
-            'CTRT_PRD': '계약기간',
-            'NEW_UPDT_YN': '신규갱신여부',
-            'CTRT_UPDT_USE_YN': '계약갱신권사용여부',
-            'BFR_GRFE': '종전보증금',
-            'BFR_RTFE': '종전임대료'
-        }
-        df = df.rename(columns=column_mapping)
-
-        # 주소 생성
-        df['주소'] = df.apply(lambda x: create_address(x, selected_gu[1]), axis=1)
-
-        # 위경도 조회 시작
-        status_container.text("🌍 위치 정보를 조회중입니다...")
-        total_addresses = len(df['주소'])
-        
-        coordinates = []
-        for idx, address in enumerate(df['주소']):
-            lng, lat = get_coordinates(address)
-            coordinates.append((lat, lng))
-            # 진행률 업데이트
-            progress = (idx + 1) / total_addresses
-            progress_bar.progress(progress)
-            status_container.text(f"🌍 위치 정보를 조회중입니다... ({idx + 1}/{total_addresses})")
-        
-        # 진행바 완료 표시
-        progress_bar.progress(1.0)
-        status_container.text("✅ 위치 정보 조회가 완료되었습니다!")
-        
-        df['위도'] = [coord[0] for coord in coordinates]
-        df['경도'] = [coord[1] for coord in coordinates]
-
-        # 필터링 옵션
-        st.subheader("필터링 옵션")
-        
-        # 보증금 범위 슬라이더
-        min_deposit_value = int(df['보증금(만원)'].fillna(0).min())
-        max_deposit_value = int(df['보증금(만원)'].fillna(0).max())
-        deposit_range = st.slider(
-            "보증금 범위 (만원)",
-            min_value=min_deposit_value,
-            max_value=max_deposit_value,
-            value=(min_deposit_value, max_deposit_value),
-            format="%d"
-        )
-        min_deposit, max_deposit = deposit_range
-        
-        # 임대료 범위 슬라이더
-        min_rent_value = int(df['임대료(만원)'].fillna(0).min())
-        max_rent_value = int(df['임대료(만원)'].fillna(0).max())
-        rent_range = st.slider(
-            "임대료 범위 (만원)",
-            min_value=min_rent_value,
-            max_value=max_rent_value,
-            value=(min_rent_value, max_rent_value),
-            format="%d"
-        )
-        min_rent, max_rent = rent_range
-        
-        # 계약기간 범위 슬라이더 (있는 경우)
-        if '계약기간' in df.columns:
-            period_values = df['계약기간'].dropna().unique()
-            if len(period_values) > 0:
-                period_values = sorted([int(x) for x in period_values if str(x).isdigit()])
-                if period_values:
-                    period_range = st.slider(
-                        "계약기간 (개월)",
-                        min_value=min(period_values),
-                        max_value=max(period_values),
-                        value=(min(period_values), max(period_values)),
-                        format="%d"
-                    )
-                    min_period, max_period = period_range        # 필터링 적용
-        filtered_df = df.copy()
-        
-        # 보증금과 임대료 필터 적용
-        filtered_df = filtered_df[
-            (filtered_df['보증금(만원)'] >= min_deposit) &
-            (filtered_df['보증금(만원)'] <= max_deposit) &
-            (filtered_df['임대료(만원)'] >= min_rent) &
-            (filtered_df['임대료(만원)'] <= max_rent)
-        ]
-        
-        # 계약기간 필터 적용 (있는 경우)
-        if '계약기간' in filtered_df.columns and 'min_period' in locals():
-            filtered_df = filtered_df[
-                filtered_df['계약기간'].apply(lambda x: 
-                    float(x) >= min_period and float(x) <= max_period 
-                    if str(x).isdigit() else False
-                )
-            ]
-
-        # 결과 표시
-        st.subheader("조회 결과")
-        st.write(f"총 {len(filtered_df)}건의 데이터가 조회되었습니다.")
-
-        # 지도 표시
-        if not filtered_df.empty:
-            center_lat = filtered_df['위도'].mean()
-            center_lng = filtered_df['경도'].mean()
-            
-            # Folium 지도 생성 시작
-            status_container.text("🗺️ 지도를 생성중입니다...")
-            progress_bar.progress(0)
-            
-            # Folium 지도 생성 및 표시
-            map_obj = create_folium_map(filtered_df, center_lat, center_lng)
-            folium_static(map_obj)
-            
-            # 진행 완료
-            progress_bar.progress(1.0)
-            status_container.text("✨ 모든 처리가 완료되었습니다!")
-
-            # 데이터 테이블 표시
-            st.subheader("상세 데이터")
-            st.dataframe(filtered_df)
-            
-            # CSV 다운로드 버튼
-            csv_data = filtered_df.to_csv(index=False, encoding='utf-8-sig')
+            csv_data = df.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
-                label="CSV 파일 다운로드",
+                label="📥 전체 데이터 CSV 다운로드",
                 data=csv_data,
-                file_name=f"서울시_임대_정보_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"서울시_임대_정보_전체_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
             )
-        else:
-            st.warning("조건에 맞는 데이터가 없습니다.")
+    else:
+        st.info("👆 사이드바에서 자치구를 선택하고 '데이터 조회' 버튼을 클릭하세요.")
 
 if __name__ == "__main__":
     main()
